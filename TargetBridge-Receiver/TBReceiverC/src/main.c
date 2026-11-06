@@ -22,6 +22,9 @@
 #include "tb_gesture_bridge.h"
 #include "tb_display_tweaks.h"
 #include "tb_i18n.h"
+#include "tb_clipboard.h"
+
+static long tb_clipboard_last_count = -1;
 
 #include <SDL.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -478,34 +481,22 @@ static void tb_json_escape_string(const char *src, char *dest, size_t size) {
 }
 
 static void tb_receiver_set_clipboard_text(const char *text) {
-    FILE *pipe = popen("pbcopy", "w");
-    if (!pipe) return;
-    if (text && *text) {
-        fwrite(text, 1, strlen(text), pipe);
-    }
-    pclose(pipe);
+    tb_clipboard_set_text(text);
+    /* Our own write must not be echoed back to the sender as a 'change'. */
+    tb_clipboard_last_count = tb_clipboard_change_count();
 }
 
 static int tb_receiver_get_clipboard_text(char *dest, size_t size) {
-    if (!dest || size == 0) return 0;
-    dest[0] = '\0';
-
-    FILE *pipe = popen("pbpaste", "r");
-    if (!pipe) return 0;
-
-    size_t total = 0;
-    while (!feof(pipe) && total + 1 < size) {
-        size_t n = fread(dest + total, 1, size - total - 1, pipe);
-        total += n;
-        if (n == 0) break;
-    }
-    dest[total] = '\0';
-    pclose(pipe);
-    return 1;
+    return tb_clipboard_get_text(dest, size);
 }
 
 static void tb_receiver_send_clipboard_if_changed(struct app *a) {
     if (!a || strcmp(a->input_control_mode, "receiverMaster") != 0 || a->client_fd < 0) return;
+
+    /* Cheap integer compare; only touch the text when the clipboard changed. */
+    const long count = tb_clipboard_change_count();
+    if (count == tb_clipboard_last_count) return;
+    tb_clipboard_last_count = count;
 
     char text[4096];
     if (!tb_receiver_get_clipboard_text(text, sizeof(text))) return;
@@ -1918,6 +1909,7 @@ static void close_client(struct app *a) {
     tb_disp_set_cursor(a->disp, 0, 0, 1, 1, 0, 0, 0);
     tb_refresh_idle_localized_strings(a);
     a->last_clipboard_text[0] = '\0';
+    tb_clipboard_last_count = -1;
     tb_parser_free(&a->parser);
     tb_parser_init(&a->parser, on_packet, a);
     tb_dec_reset(a->dec);   /* fresh decoder for next session */
