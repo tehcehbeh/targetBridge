@@ -48,6 +48,9 @@ void tb_disp_render_nv12(struct tb_display *d,
                          const uint8_t *uv, int uv_stride,
                          int w, int h);
 
+/* Record how long one tb_dec_feed_frame call took (perf stats only). */
+void tb_disp_note_decode(struct tb_display *d, unsigned int ms);
+
 /* Update low-latency local cursor overlay in source-frame coordinates. */
 void tb_disp_set_cursor(struct tb_display *d,
                         int x, int y,

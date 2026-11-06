@@ -1194,7 +1194,11 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         break;
     case TB_PKT_FRAME:
         a->session_active = 1;
-        tb_dec_feed_frame(a->dec, payload, len);
+        {
+            const Uint32 f0 = SDL_GetTicks();
+            tb_dec_feed_frame(a->dec, payload, len);
+            tb_disp_note_decode(a->disp, (unsigned int)(SDL_GetTicks() - f0));
+        }
         break;
     case TB_PKT_RAW_FRAME:
         a->session_active = 1;

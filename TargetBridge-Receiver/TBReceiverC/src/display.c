@@ -65,6 +65,15 @@ struct tb_display {
     uint32_t      stat_tick;
     unsigned int  stat_moves, stat_renders, stat_cursor_pkts;
     unsigned int  stat_render_ms_total, stat_render_ms_max;
+    /* Frame pipeline perf: uploads are done per decoded frame, but the (vsync
+     * prone) present is coalesced: at most one per event-loop pass, so a backlog
+     * of decoded frames can never turn into one blocking present each. */
+    int           frame_dirty;
+    unsigned int  stat_up_n, stat_up_ms, stat_up_max;
+    unsigned int  stat_dec_n, stat_dec_ms, stat_dec_max;
+    unsigned int  stat_pr_n, stat_pr_ms, stat_pr_max;
+    unsigned int  stat_coalesced;
+    uint32_t      loop_max_gap_ms, last_poll_tick;
 
     char          last_ip[64];
     char          last_status[128];
@@ -1149,14 +1158,28 @@ void tb_disp_render_nv12(struct tb_display *d,
     if (tb_disp_ensure_texture(d, w, h) < 0) return;
     tb_disp_set_connection_state(d, 1);
 
+    const uint32_t u0 = SDL_GetTicks();
     if (SDL_UpdateNVTexture(d->tex, NULL,
                             y,  y_stride,
                             uv, uv_stride) < 0) {
         fprintf(stderr, "[disp] UpdateNVTexture: %s\n", SDL_GetError());
         return;
     }
-    d->last_video_frame_time = SDL_GetTicks();
-    tb_disp_render_current(d);
+    const uint32_t u1 = SDL_GetTicks();
+    d->last_video_frame_time = u1;
+    d->stat_up_n++;
+    d->stat_up_ms += u1 - u0;
+    if (u1 - u0 > d->stat_up_max) d->stat_up_max = u1 - u0;
+    if (d->frame_dirty) d->stat_coalesced++;
+    /* Present later, once per loop pass (see tb_disp_poll_actions). */
+    d->frame_dirty = 1;
+}
+
+void tb_disp_note_decode(struct tb_display *d, unsigned int ms) {
+    if (!d) return;
+    d->stat_dec_n++;
+    d->stat_dec_ms += ms;
+    if (ms > d->stat_dec_max) d->stat_dec_max = ms;
 }
 
 void tb_disp_set_cursor(struct tb_display *d,
@@ -1356,8 +1379,9 @@ unsigned int tb_disp_poll_actions(struct tb_display *d) {
             }
         }
     }
-    if (d->cursor_dirty) {
+    if (d->cursor_dirty || d->frame_dirty) {
         d->cursor_dirty = 0;
+        d->frame_dirty = 0;
         if (d->is_connected && d->tex) {
             const uint32_t t0 = SDL_GetTicks();
             tb_disp_render_current(d);
@@ -1368,21 +1392,31 @@ unsigned int tb_disp_poll_actions(struct tb_display *d) {
         }
     }
     {
-        /* Once per second: what does the local cursor prediction actually do? */
+        /* Once per second: where does the time go? */
         const uint32_t now = SDL_GetTicks();
+        if (d->last_poll_tick && now - d->last_poll_tick > d->loop_max_gap_ms)
+            d->loop_max_gap_ms = now - d->last_poll_tick;
+        d->last_poll_tick = now;
         if (now - d->stat_tick >= 1000) {
-            if (d->stat_moves || d->stat_cursor_pkts) {
+            if (d->stat_up_n || d->stat_moves || d->stat_cursor_pkts) {
                 fprintf(stderr,
-                        "[cursor] predict=%d visible=%d moves/s=%u renders/s=%u render_avg=%ums render_max=%ums sender_cursor_pkts/s=%u src=%dx%d\n",
-                        d->cursor_predict_enabled, d->cursor_visible,
-                        d->stat_moves, d->stat_renders,
+                        "[perf] dec=%u/s (avg %ums max %ums) upload avg %ums max %ums | present=%u/s avg %ums max %ums | skipped_presents=%u | loop_gap_max=%ums | cursor predict=%d visible=%d moves/s=%u sender_cursor_pkts/s=%u\n",
+                        d->stat_dec_n,
+                        d->stat_dec_n ? d->stat_dec_ms / d->stat_dec_n : 0, d->stat_dec_max,
+                        d->stat_up_n ? d->stat_up_ms / d->stat_up_n : 0, d->stat_up_max,
+                        d->stat_renders,
                         d->stat_renders ? d->stat_render_ms_total / d->stat_renders : 0,
-                        d->stat_render_ms_max, d->stat_cursor_pkts,
-                        d->cursor_source_w, d->cursor_source_h);
+                        d->stat_render_ms_max, d->stat_coalesced, d->loop_max_gap_ms,
+                        d->cursor_predict_enabled, d->cursor_visible,
+                        d->stat_moves, d->stat_cursor_pkts);
             }
             d->stat_tick = now;
             d->stat_moves = d->stat_renders = d->stat_cursor_pkts = 0;
             d->stat_render_ms_total = d->stat_render_ms_max = 0;
+            d->stat_up_n = d->stat_up_ms = d->stat_up_max = 0;
+            d->stat_dec_n = d->stat_dec_ms = d->stat_dec_max = 0;
+            d->stat_coalesced = 0;
+            d->loop_max_gap_ms = 0;
         }
     }
     if (d->quit) actions |= TB_DISP_ACTION_QUIT;
