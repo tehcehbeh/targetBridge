@@ -52,6 +52,15 @@ struct tb_display {
     int           cursor_large;
     uint32_t      last_video_frame_time;
     int           system_cursor_hidden;
+    /* Local cursor prediction: while the user moves the mouse we advance the
+     * drawn cursor immediately by the same deltas that are sent to the Sender,
+     * instead of waiting for the Sender's cursor packet to make the round trip
+     * (capture + encode + network + decode). The Sender's position is only
+     * adopted again once local motion has stopped, so the cursor cannot drift.
+     * Disable for A/B testing with the environment variable TB_NO_CURSOR_PREDICT=1. */
+    int           cursor_predict_enabled;
+    uint32_t      last_local_motion_tick;
+    uint32_t      last_predict_render_tick;
 
     char          last_ip[64];
     char          last_status[128];
@@ -617,6 +626,9 @@ struct tb_display *tb_disp_create(int fullscreen) {
     d->cursor_type = 0;
     d->system_cursor_hidden = 0;
     d->last_video_frame_time = 0;
+    d->cursor_predict_enabled = getenv("TB_NO_CURSOR_PREDICT") == NULL;
+    d->last_local_motion_tick = 0;
+    d->last_predict_render_tick = 0;
 
     tb_disp_refresh_window_mode(d);
     SDL_ShowWindow(d->win);
@@ -1146,19 +1158,47 @@ void tb_disp_set_cursor(struct tb_display *d,
                         int type,
                         int large) {
     if (!d) return;
-    d->cursor_x = x;
-    d->cursor_y = y;
+    uint32_t now = SDL_GetTicks();
+    /* While the local mouse is moving, our predicted position is newer than
+     * the Sender's report, so keep it. Adopt the Sender's position once the
+     * mouse has been still for 120 ms (also corrects any accumulated error). */
+    const int predicting = d->cursor_predict_enabled &&
+                           d->cursor_visible &&
+                           (now - d->last_local_motion_tick) < 120;
+    if (!predicting) {
+        d->cursor_x = x;
+        d->cursor_y = y;
+    }
     d->cursor_source_w = source_w > 0 ? source_w : 1;
     d->cursor_source_h = source_h > 0 ? source_h : 1;
     d->cursor_visible = visible;
     d->cursor_type = type;
     d->cursor_large = large;
 
-    uint32_t now = SDL_GetTicks();
     if (now - d->last_video_frame_time > 40) {
         if (d->is_connected && d->tex) {
             tb_disp_render_current(d);
         }
+    }
+}
+
+/* Advance the drawn cursor by the mouse delta right away (see struct comment). */
+static void tb_disp_predict_cursor(struct tb_display *d, int dx, int dy) {
+    if (!d || !d->cursor_predict_enabled || !d->cursor_visible) return;
+    int nx = d->cursor_x + dx;
+    int ny = d->cursor_y + dy;
+    if (nx < 0) nx = 0;
+    if (ny < 0) ny = 0;
+    if (nx > d->cursor_source_w - 1) nx = d->cursor_source_w - 1;
+    if (ny > d->cursor_source_h - 1) ny = d->cursor_source_h - 1;
+    d->cursor_x = nx;
+    d->cursor_y = ny;
+
+    uint32_t now = SDL_GetTicks();
+    d->last_local_motion_tick = now;
+    if (d->is_connected && d->tex && now != d->last_predict_render_tick) {
+        d->last_predict_render_tick = now;
+        tb_disp_render_current(d);
     }
 }
 
@@ -1199,6 +1239,7 @@ unsigned int tb_disp_poll_actions(struct tb_display *d) {
                 input_event.dx = ev.motion.xrel;
                 input_event.dy = ev.motion.yrel;
                 tb_disp_queue_input_event(d, &input_event);
+                tb_disp_predict_cursor(d, ev.motion.xrel, ev.motion.yrel);
                 break;
             case SDL_MOUSEWHEEL:
             {

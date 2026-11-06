@@ -1,0 +1,43 @@
+name: Fork Receiver Build (Intel iMac)
+
+# Baut nur den Empfänger als .app für Intel (x86_64) und stellt ihn als Download
+# (Artifact) bereit. Start: Actions -> "Fork Receiver Build (Intel iMac)" -> Run workflow,
+# oder automatisch bei jedem Push auf den Branch "local-cursor-prediction".
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ local-cursor-prediction ]
+
+jobs:
+  build-receiver-intel:
+    runs-on: macos-15-intel
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Install Dependencies
+        run: |
+          brew install ffmpeg jq sdl2 sdl3 dylibbundler
+
+      - name: Run Receiver Parser Tests
+        run: |
+          cd TargetBridge-Receiver/TBReceiverC
+          make test
+
+      - name: Build Receiver App
+        run: |
+          cd TargetBridge-Receiver
+          ./scripts/build_tbreceiver_c_app.sh
+
+      - name: Zip App Bundle
+        run: |
+          cd build
+          ditto -c -k --sequesterRsrc --keepParent "TargetBridge Receiver.app" TargetBridge-Receiver-intel.zip
+
+      - name: Upload Receiver App
+        uses: actions/upload-artifact@v7
+        with:
+          name: TargetBridge-Receiver-intel
+          path: build/TargetBridge-Receiver-intel.zip
+          if-no-files-found: error
