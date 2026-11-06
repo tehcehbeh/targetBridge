@@ -210,6 +210,7 @@ static int tb_receiver_get_clipboard_text(char *dest, size_t size);
 static void tb_receiver_send_clipboard_if_changed(struct app *a);
 static void write_be32(uint8_t *dst, uint32_t value);
 static void tb_receiver_send_display_tweaks_if_changed(struct app *a);
+static void tb_receiver_flush_input(struct app *a);
 
 static int tb_receiver_is_valid_language_pref(const char *language_pref) {
     return language_pref &&
@@ -1190,6 +1191,10 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
             tb_dec_feed_frame(a->dec, payload, len);
             tb_disp_note_decode(a->disp, (unsigned int)(SDL_GetTicks() - f0));
         }
+        /* Let the event tap deliver fresh mouse events and forward them now,
+         * not after the whole backlog of frames has been decoded. */
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, true);
+        tb_receiver_flush_input(a);
         break;
     case TB_PKT_RAW_FRAME:
         a->session_active = 1;
@@ -1946,6 +1951,75 @@ static void build_display_host(char *buf, size_t bufsz, const char *ip_fallback,
 
 /* ---- Main ------------------------------------------------------------ */
 
+/* Send queued mouse/keyboard events of the local user to the sender right away.
+ * Called from the main loop and between decoded frames so that a burst of
+ * pending video frames cannot hold back input for tens of milliseconds. */
+static void tb_receiver_flush_input(struct app *a) {
+    if (!a || a->client_fd < 0 || strcmp(a->input_control_mode, "receiverMaster") != 0) return;
+    struct tb_input_event input_event;
+    while (tb_disp_pop_input_event(a->disp, &input_event)) {
+        switch (input_event.kind) {
+        case TB_INPUT_EVENT_MOVE:
+            tb_receiver_send_input_event(a, "move", 1, input_event.dx, 1, input_event.dy, 0, 0, 0, 0, 0, 0);
+            break;
+        case TB_INPUT_EVENT_LEFT_DRAG:
+            tb_receiver_send_input_event(a, "leftDrag", 1, input_event.dx, 1, input_event.dy, 0, 0, 0, 0, 0, 0);
+            break;
+        case TB_INPUT_EVENT_RIGHT_DRAG:
+            tb_receiver_send_input_event(a, "rightDrag", 1, input_event.dx, 1, input_event.dy, 0, 0, 0, 0, 0, 0);
+            break;
+        case TB_INPUT_EVENT_OTHER_DRAG:
+            tb_receiver_send_input_event(a, "otherDrag", 1, input_event.dx, 1, input_event.dy, 0, 0, 0, 0, 0, 0);
+            break;
+        case TB_INPUT_EVENT_SCROLL:
+            tb_receiver_send_input_event(a, "scroll", 0, 0, 0, 0, 1, input_event.scroll_x, 1, input_event.scroll_y, 0, 0);
+            break;
+        case TB_INPUT_EVENT_LEFT_DOWN:
+            tb_receiver_send_input_button_event(a, "leftDown", input_event.click_count);
+            break;
+        case TB_INPUT_EVENT_LEFT_UP:
+            tb_receiver_send_input_button_event(a, "leftUp", input_event.click_count);
+            break;
+        case TB_INPUT_EVENT_RIGHT_DOWN:
+            tb_receiver_send_input_button_event(a, "rightDown", input_event.click_count);
+            break;
+        case TB_INPUT_EVENT_RIGHT_UP:
+            tb_receiver_send_input_button_event(a, "rightUp", input_event.click_count);
+            break;
+        case TB_INPUT_EVENT_OTHER_DOWN:
+            tb_receiver_send_input_button_event(a, "otherDown", input_event.click_count);
+            break;
+        case TB_INPUT_EVENT_OTHER_UP:
+            tb_receiver_send_input_button_event(a, "otherUp", input_event.click_count);
+            break;
+        case TB_INPUT_EVENT_KEY_DOWN:
+            tb_receiver_send_input_event(a, "keyDown", 0, 0, 0, 0, 0, 0, 0, 0, 1, input_event.key_code);
+            break;
+        case TB_INPUT_EVENT_KEY_UP:
+            tb_receiver_send_input_event(a, "keyUp", 0, 0, 0, 0, 0, 0, 0, 0, 1, input_event.key_code);
+            break;
+        case TB_INPUT_EVENT_SWITCH_PREV_TARGET:
+            tb_receiver_send_target_switch(a, -1);
+            break;
+        case TB_INPUT_EVENT_SWITCH_NEXT_TARGET:
+            tb_receiver_send_target_switch(a, 1);
+            break;
+        case TB_INPUT_EVENT_SWITCH_PREV_SPACE:
+            tb_receiver_send_space_switch(a, -1);
+            break;
+        case TB_INPUT_EVENT_SWITCH_NEXT_SPACE:
+            tb_receiver_send_space_switch(a, 1);
+            break;
+        case TB_INPUT_EVENT_DEACTIVATE_CONTROL:
+            tb_receiver_send_deactivate_control(a);
+            break;
+        case TB_INPUT_EVENT_NONE:
+        default:
+            break;
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     int fullscreen = 1;
     for (int i = 1; i < argc; i++) {
@@ -2206,68 +2280,7 @@ int main(int argc, char **argv) {
                 a.last_clipboard_poll_ms = t;
                 tb_receiver_send_clipboard_if_changed(&a);
             }
-            struct tb_input_event input_event;
-            while (tb_disp_pop_input_event(a.disp, &input_event)) {
-                switch (input_event.kind) {
-                case TB_INPUT_EVENT_MOVE:
-                    tb_receiver_send_input_event(&a, "move", 1, input_event.dx, 1, input_event.dy, 0, 0, 0, 0, 0, 0);
-                    break;
-                case TB_INPUT_EVENT_LEFT_DRAG:
-                    tb_receiver_send_input_event(&a, "leftDrag", 1, input_event.dx, 1, input_event.dy, 0, 0, 0, 0, 0, 0);
-                    break;
-                case TB_INPUT_EVENT_RIGHT_DRAG:
-                    tb_receiver_send_input_event(&a, "rightDrag", 1, input_event.dx, 1, input_event.dy, 0, 0, 0, 0, 0, 0);
-                    break;
-                case TB_INPUT_EVENT_OTHER_DRAG:
-                    tb_receiver_send_input_event(&a, "otherDrag", 1, input_event.dx, 1, input_event.dy, 0, 0, 0, 0, 0, 0);
-                    break;
-                case TB_INPUT_EVENT_SCROLL:
-                    tb_receiver_send_input_event(&a, "scroll", 0, 0, 0, 0, 1, input_event.scroll_x, 1, input_event.scroll_y, 0, 0);
-                    break;
-                case TB_INPUT_EVENT_LEFT_DOWN:
-                    tb_receiver_send_input_button_event(&a, "leftDown", input_event.click_count);
-                    break;
-                case TB_INPUT_EVENT_LEFT_UP:
-                    tb_receiver_send_input_button_event(&a, "leftUp", input_event.click_count);
-                    break;
-                case TB_INPUT_EVENT_RIGHT_DOWN:
-                    tb_receiver_send_input_button_event(&a, "rightDown", input_event.click_count);
-                    break;
-                case TB_INPUT_EVENT_RIGHT_UP:
-                    tb_receiver_send_input_button_event(&a, "rightUp", input_event.click_count);
-                    break;
-                case TB_INPUT_EVENT_OTHER_DOWN:
-                    tb_receiver_send_input_button_event(&a, "otherDown", input_event.click_count);
-                    break;
-                case TB_INPUT_EVENT_OTHER_UP:
-                    tb_receiver_send_input_button_event(&a, "otherUp", input_event.click_count);
-                    break;
-                case TB_INPUT_EVENT_KEY_DOWN:
-                    tb_receiver_send_input_event(&a, "keyDown", 0, 0, 0, 0, 0, 0, 0, 0, 1, input_event.key_code);
-                    break;
-                case TB_INPUT_EVENT_KEY_UP:
-                    tb_receiver_send_input_event(&a, "keyUp", 0, 0, 0, 0, 0, 0, 0, 0, 1, input_event.key_code);
-                    break;
-                case TB_INPUT_EVENT_SWITCH_PREV_TARGET:
-                    tb_receiver_send_target_switch(&a, -1);
-                    break;
-                case TB_INPUT_EVENT_SWITCH_NEXT_TARGET:
-                    tb_receiver_send_target_switch(&a, 1);
-                    break;
-                case TB_INPUT_EVENT_SWITCH_PREV_SPACE:
-                    tb_receiver_send_space_switch(&a, -1);
-                    break;
-                case TB_INPUT_EVENT_SWITCH_NEXT_SPACE:
-                    tb_receiver_send_space_switch(&a, 1);
-                    break;
-                case TB_INPUT_EVENT_DEACTIVATE_CONTROL:
-                    tb_receiver_send_deactivate_control(&a);
-                    break;
-                case TB_INPUT_EVENT_NONE:
-                default:
-                    break;
-                }
-            }
+            tb_receiver_flush_input(&a);
         }
 
         /* FPS log */
