@@ -61,6 +61,10 @@ struct tb_display {
     int           cursor_predict_enabled;
     uint32_t      last_local_motion_tick;
     uint32_t      last_predict_render_tick;
+    int           cursor_dirty;
+    uint32_t      stat_tick;
+    unsigned int  stat_moves, stat_renders, stat_cursor_pkts;
+    unsigned int  stat_render_ms_total, stat_render_ms_max;
 
     char          last_ip[64];
     char          last_status[128];
@@ -629,6 +633,10 @@ struct tb_display *tb_disp_create(int fullscreen) {
     d->cursor_predict_enabled = getenv("TB_NO_CURSOR_PREDICT") == NULL;
     d->last_local_motion_tick = 0;
     d->last_predict_render_tick = 0;
+    d->cursor_dirty = 0;
+    d->stat_tick = 0;
+    d->stat_moves = d->stat_renders = d->stat_cursor_pkts = 0;
+    d->stat_render_ms_total = d->stat_render_ms_max = 0;
 
     tb_disp_refresh_window_mode(d);
     SDL_ShowWindow(d->win);
@@ -1158,6 +1166,7 @@ void tb_disp_set_cursor(struct tb_display *d,
                         int type,
                         int large) {
     if (!d) return;
+    d->stat_cursor_pkts++;
     uint32_t now = SDL_GetTicks();
     /* While the local mouse is moving, our predicted position is newer than
      * the Sender's report, so keep it. Adopt the Sender's position once the
@@ -1194,12 +1203,13 @@ static void tb_disp_predict_cursor(struct tb_display *d, int dx, int dy) {
     d->cursor_x = nx;
     d->cursor_y = ny;
 
-    uint32_t now = SDL_GetTicks();
-    d->last_local_motion_tick = now;
-    if (d->is_connected && d->tex && now != d->last_predict_render_tick) {
-        d->last_predict_render_tick = now;
-        tb_disp_render_current(d);
-    }
+    d->last_local_motion_tick = SDL_GetTicks();
+    /* Do NOT render here: SDL_RenderPresent can block until the next vsync and
+     * this runs once per mouse event. Just mark the cursor dirty; the event loop
+     * renders once after all pending events were handled (see end of
+     * tb_disp_poll_actions). */
+    d->cursor_dirty = 1;
+    d->stat_moves++;
 }
 
 unsigned int tb_disp_poll_actions(struct tb_display *d) {
@@ -1344,6 +1354,35 @@ unsigned int tb_disp_poll_actions(struct tb_display *d) {
             default:
                 break;
             }
+        }
+    }
+    if (d->cursor_dirty) {
+        d->cursor_dirty = 0;
+        if (d->is_connected && d->tex) {
+            const uint32_t t0 = SDL_GetTicks();
+            tb_disp_render_current(d);
+            const uint32_t dt = SDL_GetTicks() - t0;
+            d->stat_renders++;
+            d->stat_render_ms_total += dt;
+            if (dt > d->stat_render_ms_max) d->stat_render_ms_max = dt;
+        }
+    }
+    {
+        /* Once per second: what does the local cursor prediction actually do? */
+        const uint32_t now = SDL_GetTicks();
+        if (now - d->stat_tick >= 1000) {
+            if (d->stat_moves || d->stat_cursor_pkts) {
+                fprintf(stderr,
+                        "[cursor] predict=%d visible=%d moves/s=%u renders/s=%u render_avg=%ums render_max=%ums sender_cursor_pkts/s=%u src=%dx%d\n",
+                        d->cursor_predict_enabled, d->cursor_visible,
+                        d->stat_moves, d->stat_renders,
+                        d->stat_renders ? d->stat_render_ms_total / d->stat_renders : 0,
+                        d->stat_render_ms_max, d->stat_cursor_pkts,
+                        d->cursor_source_w, d->cursor_source_h);
+            }
+            d->stat_tick = now;
+            d->stat_moves = d->stat_renders = d->stat_cursor_pkts = 0;
+            d->stat_render_ms_total = d->stat_render_ms_max = 0;
         }
     }
     if (d->quit) actions |= TB_DISP_ACTION_QUIT;
